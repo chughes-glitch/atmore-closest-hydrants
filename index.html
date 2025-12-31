@@ -1,0 +1,84 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>City of Atmore – Closest Hydrants</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 16px; }
+    input, button { font-size: 18px; padding: 10px; width: 100%; margin: 6px 0; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 12px; margin-top: 12px; }
+    .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+    .muted { color: #666; font-size: 14px; }
+    .hydrantTitle { font-size: 18px; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h2>City of Atmore – Closest Hydrants</h2>
+
+  <input id="addr" placeholder="Enter address (e.g., 123 Main St, Atmore, AL)" />
+  <button id="go">Find Top 3 Closest Hydrants</button>
+  <div class="muted">Tip: include “Atmore, AL”.</div>
+
+  <div id="out" class="card" style="display:none;"></div>
+
+<script>
+const HYDRANT_CSV_URL = "hydrants.csv";
+const NOMINATIM_URL = "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=";
+let hydrants = [];
+
+function toRad(x){ return x * Math.PI / 180; }
+function haversine(lat1, lon1, lat2, lon2){
+  const R = 6371000;
+  const dLat = toRad(lat2-lat1);
+  const dLon = toRad(lon2-lon1);
+  const a = Math.sin(dLat/2)**2 +
+    Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+  return 2*R*Math.asin(Math.sqrt(a));
+}
+function parseCSV(text){
+  const lines = text.trim().split(/\r?\n/);
+  const header = lines[0].split(",");
+  const iLat = header.findIndex(h=>/lat/i.test(h));
+  const iLon = header.findIndex(h=>/(lon|lng)/i.test(h));
+  const iName = header.findIndex(h=>/name/i.test(h));
+  return lines.slice(1).map(l=>{
+    const c=l.split(",");
+    return {name:c[iName],lat:+c[iLat],lon:+c[iLon]};
+  }).filter(h=>!isNaN(h.lat)&&!isNaN(h.lon));
+}
+async function loadHydrants(){
+  const r=await fetch(HYDRANT_CSV_URL,{cache:"no-store"});
+  hydrants=parseCSV(await r.text());
+}
+async function geocode(a){
+  const r=await fetch(NOMINATIM_URL+encodeURIComponent(a));
+  const j=await r.json();
+  if(!j[0]) throw "Address not found";
+  return {lat:+j[0].lat,lon:+j[0].lon,label:j[0].display_name};
+}
+function gLink(lat,lon){return `https://www.google.com/maps/dir/?api=1&destination=${lat},${lon}`;}
+function aLink(lat,lon){return `https://maps.apple.com/?daddr=${lat},${lon}&dirflg=d`;}
+
+document.getElementById("go").onclick=async()=>{
+  try{
+    if(!hydrants.length) await loadHydrants();
+    const a=document.getElementById("addr").value;
+    const p=await geocode(a);
+    const top=hydrants.map(h=>({h,d:haversine(p.lat,p.lon,h.lat,h.lon)}))
+      .sort((a,b)=>a.d-b.d).slice(0,3);
+    const o=document.getElementById("out");
+    o.style.display="block";
+    o.innerHTML=`<b>Address:</b> ${p.label}<hr>`+
+      top.map((x,i)=>`
+      <div class="hydrantTitle">#${i+1} Hydrant ${x.h.name}</div>
+      <div>${(x.d*3.28).toFixed(0)} ft</div>
+      <div class="btns">
+        <button onclick="location.href='${gLink(x.h.lat,x.h.lon)}'">Google</button>
+        <button onclick="location.href='${aLink(x.h.lat,x.h.lon)}'">Apple</button>
+      </div>`).join("");
+  }catch(e){alert(e);}
+};
+</script>
+</body>
+</html>
