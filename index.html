@@ -1,11 +1,11 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>City of Atmore – Closest Hydrants</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>City of Atmore — Closest Hydrants</title>
 
-  <!-- Leaflet (free map library) -->
+  <!-- Free map (Leaflet) -->
   <link
     rel="stylesheet"
     href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
@@ -19,252 +19,437 @@
   ></script>
 
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 12px; }
-    #map { height: 52vh; width: 100%; border-radius: 12px; border: 1px solid #ddd; }
-    input, button { font-size: 16px; padding: 10px; width: 100%; margin: 6px 0; }
-    .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-    .card { border: 1px solid #ddd; border-radius: 12px; padding: 12px; margin-top: 10px; }
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    header { padding: 12px 14px; border-bottom: 1px solid #e5e5e5; }
+    h1 { font-size: 18px; margin: 0 0 6px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    input[type="text"] { flex: 1; min-width: 240px; padding: 10px; font-size: 16px; }
+    button { padding: 10px 12px; font-size: 16px; cursor: pointer; }
+    label { display: inline-flex; align-items: center; gap: 6px; font-size: 14px; color: #333; }
+    #map { height: calc(100vh - 170px); } /* leaves room for header + results */
+    .panel { padding: 10px 14px; border-top: 1px solid #e5e5e5; background: #fafafa; }
+    .card { background: #fff; border: 1px solid #e5e5e5; border-radius: 10px; padding: 10px; margin-top: 8px; }
     .muted { color: #666; font-size: 13px; }
-    .hTitle { font-size: 16px; margin-top: 10px; }
-    .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
-    .small { font-size: 13px; }
+    .big { font-size: 16px; }
+    .btns { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
+    .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; background:#f2f2f2; font-size: 12px; margin-left: 6px; }
+    .warn { color: #8a2b2b; }
   </style>
 </head>
-
 <body>
-  <h2 style="margin:6px 0 10px;">City of Atmore – Closest Hydrants</h2>
 
-  <div id="map"></div>
+<header>
+  <h1>City of Atmore — Closest Hydrants</h1>
 
-  <div class="card">
-    <input id="addr" placeholder="Enter address (e.g., 123 Main St, Atmore, AL)" />
-    <div class="row2">
-      <button id="find">Find Closest (Top 3)</button>
-      <button id="gps">Use My GPS Location</button>
-    </div>
-    <div class="muted">
-      Tip: include “Atmore, AL”. Hydrants show as blue dots. Top 3 highlight in red.
-    </div>
+  <div class="row">
+    <input id="addr" type="text" placeholder='Enter incident address (ex: "123 Main St, Atmore, AL")' />
+    <button id="findBtn" type="button">Find Top 3 to Address</button>
   </div>
 
+  <div class="row" style="margin-top:10px;">
+    <button id="gpsBtn" type="button">Use My Location (GPS)</button>
+
+    <label><input id="autoGps" type="checkbox" checked /> Auto GPS on open</label>
+    <label><input id="ringsToggle" type="checkbox" checked /> Show 300/600/1000 ft rings</label>
+    <label><input id="showAllHydrants" type="checkbox" checked /> Show all hydrants</label>
+
+    <span class="muted">Tip: If search is off, add “Atmore, AL”.</span>
+  </div>
+
+  <div class="muted" id="statusLine"></div>
+</header>
+
+<div id="map"></div>
+
+<div class="panel">
+  <div class="muted">Results</div>
   <div id="out" class="card" style="display:none;"></div>
+</div>
 
 <script>
-  // ====== CONFIG ======
-  const HYDRANT_CSV_URL = "hydrants.csv";
+  /********************
+   * CONFIG
+   ********************/
+  const HYDRANT_CSV_URL = "hydrants_for_google_my_maps.csv";  // keep this filename in your repo
   const NOMINATIM_URL = "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=";
 
-  // ====== State ======
-  let hydrants = [];
-  let map, incidentMarker, gpsMarker;
-  let hydrantLayer = L.layerGroup();
-  let topLayer = L.layerGroup();
+  // Atmore-ish default center (safe fallback)
+  const DEFAULT_CENTER = [31.023, -87.493];
+  const DEFAULT_ZOOM = 13;
 
-  // ====== Helpers ======
-  function toRad(x){ return x * Math.PI / 180; }
+  /********************
+   * MAP SETUP
+   ********************/
+  const map = L.map("map", { zoomControl: true }).setView(DEFAULT_CENTER, DEFAULT_ZOOM);
 
-  // Haversine meters
-  function haversine(lat1, lon1, lat2, lon2){
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+
+  const hydrantLayer = L.layerGroup().addTo(map);
+  const top3Layer = L.layerGroup().addTo(map);
+  const incidentLayer = L.layerGroup().addTo(map);
+  const userLayer = L.layerGroup().addTo(map);
+  const ringsLayer = L.layerGroup().addTo(map);
+
+  let hydrants = []; // {name, lat, lon}
+
+  function setStatus(msg, isWarn=false) {
+    const el = document.getElementById("statusLine");
+    el.textContent = msg || "";
+    el.className = "muted" + (isWarn ? " warn" : "");
+  }
+
+  /********************
+   * UTILITIES
+   ********************/
+  function haversineMeters(lat1, lon1, lat2, lon2) {
     const R = 6371000;
+    const toRad = (x) => x * Math.PI / 180;
     const dLat = toRad(lat2 - lat1);
     const dLon = toRad(lon2 - lon1);
-    const a = Math.sin(dLat/2)**2 +
-              Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon/2)**2;
+    const a =
+      Math.sin(dLat / 2) ** 2 +
+      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
     return 2 * R * Math.asin(Math.sqrt(a));
   }
 
-  function metersToFeet(m){ return m * 3.28084; }
-  function metersToMiles(m){ return m / 1609.344; }
-  function formatDistance(m){
-    const miles = metersToMiles(m);
-    if (miles < 0.25) return `${Math.round(metersToFeet(m))} ft`;
-    return `${miles.toFixed(2)} mi`;
+  function metersToFeet(m) {
+    return m * 3.28084;
   }
 
-  function googleNavLink(lat, lon){
-    return `https://www.google.com/maps/dir/?api=1&destination=${lat},${lon}&travelmode=driving`;
-  }
-  function appleNavLink(lat, lon){
-    return `https://maps.apple.com/?daddr=${lat},${lon}&dirflg=d`;
+  function ftToMeters(ft) {
+    return ft * 0.3048;
   }
 
-  function parseCSV(text){
-    const lines = text.trim().split(/\r?\n/);
-    const header = lines[0].split(",").map(h => h.trim());
+  function clearTop3() { top3Layer.clearLayers(); }
+  function clearIncident() { incidentLayer.clearLayers(); }
+  function clearUser() { userLayer.clearLayers(); }
+  function clearRings() { ringsLayer.clearLayers(); }
 
-    const idxName = header.findIndex(h => /^name$/i.test(h));
-    const idxLat  = header.findIndex(h => /^latitude$/i.test(h) || /lat/i.test(h));
-    const idxLon  = header.findIndex(h => /^longitude$/i.test(h) || /(lon|lng|long)/i.test(h));
+  function drawRings(lat, lon) {
+    clearRings();
+    const show = document.getElementById("ringsToggle").checked;
+    if (!show) return;
 
-    if (idxName < 0 || idxLat < 0 || idxLon < 0) {
-      throw new Error("hydrants.csv must have headers: Name,Latitude,Longitude");
-    }
+    const opts300 = { radius: ftToMeters(300),  weight: 2, fillOpacity: 0.03 };
+    const opts600 = { radius: ftToMeters(600),  weight: 2, fillOpacity: 0.02 };
+    const opts1000= { radius: ftToMeters(1000), weight: 2, fillOpacity: 0.01 };
 
+    L.circle([lat, lon], opts300).addTo(ringsLayer);
+    L.circle([lat, lon], opts600).addTo(ringsLayer);
+    L.circle([lat, lon], opts1000).addTo(ringsLayer);
+  }
+
+  function buildGoogleNavLink(lat, lon, label) {
+    // Opens Google Maps directions to that point
+    const q = encodeURIComponent(`${lat},${lon} (${label || "Hydrant"})`);
+    return `https://www.google.com/maps/dir/?api=1&destination=${q}`;
+  }
+
+  /********************
+   * CSV PARSER (simple, handles commas in basic cases)
+   ********************/
+  function parseCSV(text) {
+    // Basic CSV parser: supports quoted fields
     const rows = [];
-    for (let i=1;i<lines.length;i++){
-      const cols = lines[i].split(",").map(c => c.trim());
-      const name = cols[idxName] || `Hydrant ${i}`;
-      const lat  = parseFloat(cols[idxLat]);
-      const lon  = parseFloat(cols[idxLon]);
-      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
-      rows.push({ name, lat, lon });
+    let row = [];
+    let cur = "";
+    let inQuotes = false;
+
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      const next = text[i+1];
+
+      if (c === '"' && inQuotes && next === '"') {
+        cur += '"'; i++;
+      } else if (c === '"') {
+        inQuotes = !inQuotes;
+      } else if (c === "," && !inQuotes) {
+        row.push(cur.trim());
+        cur = "";
+      } else if ((c === "\n" || c === "\r") && !inQuotes) {
+        if (cur.length || row.length) {
+          row.push(cur.trim());
+          rows.push(row);
+        }
+        row = [];
+        cur = "";
+        // skip \r\n combo
+        if (c === "\r" && next === "\n") i++;
+      } else {
+        cur += c;
+      }
+    }
+    if (cur.length || row.length) {
+      row.push(cur.trim());
+      rows.push(row);
     }
     return rows;
   }
 
-  async function loadHydrants(){
+  async function loadHydrants() {
+    setStatus("Loading hydrants…");
     const res = await fetch(HYDRANT_CSV_URL, { cache: "no-store" });
-    if (!res.ok) throw new Error("Could not load hydrants.csv. Make sure it's in the repo root.");
+    if (!res.ok) throw new Error(`Could not load ${HYDRANT_CSV_URL} (${res.status})`);
     const text = await res.text();
-    hydrants = parseCSV(text);
-    if (!hydrants.length) throw new Error("No hydrants found in hydrants.csv.");
+
+    const rows = parseCSV(text);
+    if (rows.length < 2) throw new Error("CSV is empty or invalid.");
+
+    const header = rows[0].map(h => h.toLowerCase());
+    const nameIdx = header.indexOf("name");
+    const latIdx  = header.indexOf("latitude");
+    const lonIdx  = header.indexOf("longitude");
+
+    if (nameIdx === -1 || latIdx === -1 || lonIdx === -1) {
+      throw new Error("CSV must have columns: Name, Latitude, Longitude.");
+    }
+
+    hydrants = rows.slice(1)
+      .filter(r => r.length >= 3)
+      .map(r => ({
+        name: r[nameIdx],
+        lat: Number(r[latIdx]),
+        lon: Number(r[lonIdx])
+      }))
+      .filter(h => Number.isFinite(h.lat) && Number.isFinite(h.lon) && h.name);
+
+    setStatus(`Loaded ${hydrants.length} hydrants.`);
+    drawAllHydrantsIfEnabled();
+    fitMapToHydrants();
   }
 
-  async function geocodeAddress(addr){
-    const url = NOMINATIM_URL + encodeURIComponent(addr);
-    const res = await fetch(url, { headers: { "Accept":"application/json" }});
-    const data = await res.json();
-    if (!data || !data[0]) throw new Error("Address not found. Try adding 'Atmore, AL'.");
-    return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon), label: data[0].display_name };
-  }
-
-  function clearTop(){
-    topLayer.clearLayers();
-    const out = document.getElementById("out");
-    out.style.display = "none";
-    out.innerHTML = "";
-  }
-
-  // ====== Map Setup ======
-  function initMap(){
-    // Default view: Atmore-ish (fine if slightly off; will auto-fit once you search)
-    map = L.map("map", { zoomControl: true }).setView([31.023, -87.494], 13);
-
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      maxZoom: 19,
-      attribution: '&copy; OpenStreetMap'
-    }).addTo(map);
-
-    hydrantLayer.addTo(map);
-    topLayer.addTo(map);
-  }
-
-  function drawHydrants(){
+  function drawAllHydrantsIfEnabled() {
     hydrantLayer.clearLayers();
+    if (!document.getElementById("showAllHydrants").checked) return;
 
-    const blue = { radius: 4, color: "#1f6feb", fillColor: "#1f6feb", fillOpacity: 0.9, weight: 1 };
-    hydrants.forEach(h => {
-      const m = L.circleMarker([h.lat, h.lon], blue)
-        .bindPopup(`<b>Hydrant:</b> ${h.name}<br><span class="small">${h.lat.toFixed(6)}, ${h.lon.toFixed(6)}</span>`);
-      hydrantLayer.addLayer(m);
-    });
+    for (const h of hydrants) {
+      const m = L.circleMarker([h.lat, h.lon], {
+        radius: 4,
+        weight: 1,
+        fillOpacity: 0.7
+      }).addTo(hydrantLayer);
+
+      m.bindPopup(`<b>${escapeHtml(h.name)}</b><br>${h.lat.toFixed(6)}, ${h.lon.toFixed(6)}`);
+    }
   }
 
-  function setIncident(lat, lon, label){
-    if (incidentMarker) map.removeLayer(incidentMarker);
-    incidentMarker = L.marker([lat, lon]).addTo(map)
-      .bindPopup(`<b>Incident:</b><br>${label || ""}`).openPopup();
+  function fitMapToHydrants() {
+    if (hydrants.length < 3) return;
+    const bounds = L.latLngBounds(hydrants.map(h => [h.lat, h.lon]));
+    map.fitBounds(bounds.pad(0.08));
   }
 
-  function setGPS(lat, lon){
-    if (gpsMarker) map.removeLayer(gpsMarker);
-    gpsMarker = L.circleMarker([lat, lon], {
-      radius: 7, color: "#111", fillColor: "#111", fillOpacity: 0.8, weight: 2
-    }).addTo(map).bindPopup("<b>Your GPS location</b>");
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
+    }[c]));
   }
 
-  function showTop3(lat, lon, label){
-    clearTop();
+  /********************
+   * TOP 3 ENGINE
+   ********************/
+  function computeTop3(lat, lon) {
+    const scored = hydrants.map(h => ({
+      ...h,
+      distM: haversineMeters(lat, lon, h.lat, h.lon)
+    }));
+    scored.sort((a,b) => a.distM - b.distM);
+    return scored.slice(0, 3);
+  }
 
-    const ranked = hydrants.map(h => ({
-      h,
-      distM: haversine(lat, lon, h.lat, h.lon)
-    }))
-    .sort((a,b) => a.distM - b.distM)
-    .slice(0, 3);
-
-    // Highlight top 3 in red
-    const red = { radius: 7, color: "#d1242f", fillColor: "#d1242f", fillOpacity: 0.95, weight: 2 };
-
-    ranked.forEach((x, idx) => {
-      const popup = `
-        <b>Top ${idx+1} Hydrant:</b> ${x.h.name}<br>
-        <b>Distance:</b> ${formatDistance(x.distM)}<br>
-        <div class="btns" style="margin-top:6px;">
-          <a href="${googleNavLink(x.h.lat, x.h.lon)}" target="_blank">Google</a>
-          <a href="${appleNavLink(x.h.lat, x.h.lon)}" target="_blank">Apple</a>
-        </div>
-      `;
-      topLayer.addLayer(L.circleMarker([x.h.lat, x.h.lon], red).bindPopup(popup));
-    });
-
-    // Fit map to incident + top hydrants
-    const pts = [[lat, lon], ...ranked.map(x => [x.h.lat, x.h.lon])];
-    map.fitBounds(pts, { padding: [25, 25] });
-
-    // Results panel
+  function showResults(title, originLat, originLon, top3) {
     const out = document.getElementById("out");
     out.style.display = "block";
-    out.innerHTML = `
-      <div><b>Incident:</b> ${label || `${lat.toFixed(6)}, ${lon.toFixed(6)}`}</div>
-      <div class="muted">Top 3 closest hydrants (tap to navigate):</div>
-      ${ranked.map((x,i)=>`
-        <div class="hTitle"><b>#${i+1} Hydrant:</b> ${x.h.name}</div>
-        <div><b>Distance:</b> ${formatDistance(x.distM)}</div>
-        <div class="btns">
-          <button onclick="location.href='${googleNavLink(x.h.lat, x.h.lon)}'">Navigate (Google)</button>
-          <button onclick="location.href='${appleNavLink(x.h.lat, x.h.lon)}'">Navigate (Apple)</button>
+
+    const items = top3.map((h, idx) => {
+      const ft = Math.round(metersToFeet(h.distM));
+      const nav = buildGoogleNavLink(h.lat, h.lon, h.name);
+      return `
+        <div class="card" style="margin-top:8px;">
+          <div class="big"><b>#${idx+1} ${escapeHtml(h.name)}</b> <span class="pill">${ft} ft</span></div>
+          <div class="muted">${h.lat.toFixed(6)}, ${h.lon.toFixed(6)}</div>
+          <div class="btns">
+            <a href="${nav}" target="_blank" rel="noopener">
+              <button type="button">Navigate to this hydrant</button>
+            </a>
+            <button type="button" data-zoom="${h.lat},${h.lon}">Zoom</button>
+          </div>
         </div>
-      `).join("")}
-      <div class="muted" style="margin-top:8px;">Tip: You can also tap any hydrant dot on the map.</div>
+      `;
+    }).join("");
+
+    out.innerHTML = `
+      <div class="big"><b>${escapeHtml(title)}</b></div>
+      <div class="muted">Origin: ${originLat.toFixed(6)}, ${originLon.toFixed(6)}</div>
+      ${items}
     `;
+
+    // zoom buttons
+    out.querySelectorAll("button[data-zoom]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const [a,b] = btn.getAttribute("data-zoom").split(",").map(Number);
+        map.setView([a,b], 17);
+      });
+    });
   }
 
-  // ====== Actions ======
-  async function findByAddress(){
-    const addr = document.getElementById("addr").value.trim();
-    if (!addr) return alert("Enter an address.");
+  function plotTop3(top3) {
+    clearTop3();
+    for (let i=0; i<top3.length; i++) {
+      const h = top3[i];
+      const m = L.circleMarker([h.lat, h.lon], {
+        radius: 8,
+        weight: 2,
+        fillOpacity: 0.8
+      }).addTo(top3Layer);
 
-    try {
-      if (!hydrants.length) {
-        await loadHydrants();
-        drawHydrants();
-      }
-      const g = await geocodeAddress(addr);
-      setIncident(g.lat, g.lon, g.label);
-      showTop3(g.lat, g.lon, g.label);
-    } catch (e){
-      alert(e.message || String(e));
+      m.bindPopup(`<b>Top ${i+1}: ${escapeHtml(h.name)}</b><br>${Math.round(metersToFeet(h.distM))} ft`);
     }
   }
 
-  async function useGPS(){
-    try {
-      if (!hydrants.length) {
-        await loadHydrants();
-        drawHydrants();
+  function plotIncident(lat, lon, label="Incident") {
+    clearIncident();
+    L.marker([lat, lon], { title: label }).addTo(incidentLayer)
+      .bindPopup(`<b>${escapeHtml(label)}</b><br>${lat.toFixed(6)}, ${lon.toFixed(6)}`)
+      .openPopup();
+  }
+
+  function plotUser(lat, lon) {
+    clearUser();
+    L.marker([lat, lon], { title: "You are here" }).addTo(userLayer)
+      .bindPopup("<b>You are here (GPS)</b>")
+      .openPopup();
+  }
+
+  function showTop3FromPoint(lat, lon, title) {
+    if (!hydrants.length) return;
+    const top3 = computeTop3(lat, lon);
+    plotTop3(top3);
+    showResults(title, lat, lon, top3);
+
+    // zoom map to show origin + top3
+    const pts = [[lat, lon], ...top3.map(h => [h.lat, h.lon])];
+    map.fitBounds(L.latLngBounds(pts).pad(0.18));
+  }
+
+  /********************
+   * GPS
+   ********************/
+  function getGps() {
+    if (!navigator.geolocation) {
+      alert("GPS not available on this device/browser.");
+      return;
+    }
+    setStatus("Getting GPS location…");
+
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const lat = pos.coords.latitude;
+        const lon = pos.coords.longitude;
+        setStatus("GPS acquired.");
+        plotUser(lat, lon);
+        showTop3FromPoint(lat, lon, "Top 3 Closest Hydrants to Your GPS Location");
+      },
+      (err) => {
+        console.log(err);
+        setStatus("Could not get GPS. Check location permissions.", true);
+        alert("Could not get GPS location. Make sure Location Services are ON and browser permission is allowed.");
+      },
+      { enableHighAccuracy: true, timeout: 12000, maximumAge: 5000 }
+    );
+  }
+
+  /********************
+   * ADDRESS SEARCH (Nominatim)
+   ********************/
+  async function geocodeAddress(query) {
+    const url = NOMINATIM_URL + encodeURIComponent(query);
+    const res = await fetch(url, {
+      headers: {
+        // polite header (Nominatim likes identifiable traffic)
+        "Accept": "application/json"
       }
-      if (!navigator.geolocation) return alert("GPS not available on this device.");
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          const lat = pos.coords.latitude;
-          const lon = pos.coords.longitude;
-          setGPS(lat, lon);
-          showTop3(lat, lon, "Your GPS location");
-        },
-        (err) => alert("Could not get GPS location. Check location permissions."),
-        { enableHighAccuracy: true, timeout: 8000 }
-      );
-    } catch (e){
-      alert(e.message || String(e));
+    });
+    if (!res.ok) throw new Error("Geocoding failed.");
+    const data = await res.json();
+    if (!data || !data.length) return null;
+    return { lat: Number(data[0].lat), lon: Number(data[0].lon), display: data[0].display_name };
+  }
+
+  async function handleFindAddress() {
+    const q = document.getElementById("addr").value.trim();
+    if (!q) {
+      alert("Enter an address first.");
+      return;
+    }
+    setStatus("Searching address…");
+
+    try {
+      const hit = await geocodeAddress(q);
+      if (!hit || !Number.isFinite(hit.lat) || !Number.isFinite(hit.lon)) {
+        setStatus("Address not found. Try adding 'Atmore, AL'.", true);
+        alert("Address not found. Try adding 'Atmore, AL'.");
+        return;
+      }
+
+      setStatus(`Found: ${hit.display}`);
+      plotIncident(hit.lat, hit.lon, "Incident");
+      drawRings(hit.lat, hit.lon);
+      showTop3FromPoint(hit.lat, hit.lon, "Top 3 Closest Hydrants to Incident Address");
+    } catch (e) {
+      console.log(e);
+      setStatus("Address search failed. Try again.", true);
+      alert("Address search failed. Try again.");
     }
   }
 
-  // ====== Init ======
-  initMap();
+  /********************
+   * EVENTS
+   ********************/
+  document.getElementById("findBtn").addEventListener("click", handleFindAddress);
+  document.getElementById("gpsBtn").addEventListener("click", getGps);
 
-  document.getElementById("find").addEventListener("click", findByAddress);
-  document.getElementById("gps").addEventListener("click", useGPS);
+  document.getElementById("showAllHydrants").addEventListener("change", () => {
+    drawAllHydrantsIfEnabled();
+  });
+
+  document.getElementById("ringsToggle").addEventListener("change", () => {
+    // redraw rings if an incident exists
+    if (incidentLayer.getLayers().length) {
+      const m = incidentLayer.getLayers()[0];
+      const ll = m.getLatLng();
+      drawRings(ll.lat, ll.lng);
+    } else {
+      clearRings();
+    }
+  });
+
+  // Enter key triggers address search
+  document.getElementById("addr").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") handleFindAddress();
+  });
+
+  /********************
+   * BOOT
+   ********************/
+  (async function boot() {
+    try {
+      await loadHydrants();
+    } catch (e) {
+      console.log(e);
+      setStatus("Could not load hydrants file. Make sure hydrants_for_google_my_maps.csv is in the repo.", true);
+      alert("Could not load hydrants file. Make sure hydrants_for_google_my_maps.csv is in the repo root.");
+    }
+
+    // Auto GPS
+    if (document.getElementById("autoGps").checked) {
+      getGps();
+    }
+  })();
 </script>
+
 </body>
 </html>
