@@ -99,7 +99,9 @@
   let hydrants = []; // {name, lat, lon}
   let gpsWatchId = null;
   let userMarker = null;
+  let userAccuracyCircle = null;
   let firstGpsFix = true;
+  let currentOrigin = null; // {lat, lon, title, type: 'incident' or 'gps'}
 
   function setStatus(msg, warn=false) {
     const el = document.getElementById("statusLine");
@@ -140,15 +142,14 @@
   }
 
   function clearRings() { ringsLayer.clearLayers(); }
-  function clearTop3() { top3Layer.clearLayers(); }
 
   function drawRings(lat, lon) {
     clearRings();
-    if (!document.getElementById("ringsToggle").checked) return;
+    if (!document.getElementById("ringsToggle").checked || !lat || !lon) return;
 
-    L.circle([lat, lon], { radius: ftToMeters(300),  weight: 2, fillOpacity: 0.03 }).addTo(ringsLayer);
-    L.circle([lat, lon], { radius: ftToMeters(600),  weight: 2, fillOpacity: 0.02 }).addTo(ringsLayer);
-    L.circle([lat, lon], { radius: ftToMeters(1000), weight: 2, fillOpacity: 0.01 }).addTo(ringsLayer);
+    L.circle([lat, lon], { radius: ftToMeters(300),  weight: 2, fillOpacity: 0.03, color: '#888' }).addTo(ringsLayer);
+    L.circle([lat, lon], { radius: ftToMeters(600),  weight: 2, fillOpacity: 0.02, color: '#888' }).addTo(ringsLayer);
+    L.circle([lat, lon], { radius: ftToMeters(1000), weight: 2, fillOpacity: 0.01, color: '#888' }).addTo(ringsLayer);
   }
 
   /********************
@@ -179,33 +180,38 @@
 
   async function loadHydrants() {
     setStatus("Loading hydrants…");
-    const res = await fetch(HYDRANT_CSV_URL, { cache: "no-store" });
-    if (!res.ok) throw new Error(`Could not load ${HYDRANT_CSV_URL} (${res.status})`);
-    const text = await res.text();
+    try {
+      const res = await fetch(HYDRANT_CSV_URL, { cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
 
-    const rows = parseCSV(text);
-    if (rows.length < 2) throw new Error("CSV is empty or invalid.");
+      const rows = parseCSV(text);
+      if (rows.length < 2) throw new Error("CSV is empty or invalid.");
 
-    const header = rows[0].map(h => h.toLowerCase());
-    const nameIdx = header.indexOf("name");
-    const latIdx  = header.indexOf("latitude");
-    const lonIdx  = header.indexOf("longitude");
+      const header = rows[0].map(h => h.toLowerCase());
+      const nameIdx = header.indexOf("name");
+      const latIdx  = header.indexOf("latitude");
+      const lonIdx  = header.indexOf("longitude");
 
-    if (nameIdx === -1 || latIdx === -1 || lonIdx === -1) {
-      throw new Error("CSV must have columns: Name, Latitude, Longitude.");
+      if (nameIdx === -1 || latIdx === -1 || lonIdx === -1) {
+        throw new Error("CSV must have columns: Name, Latitude, Longitude.");
+      }
+
+      hydrants = rows.slice(1)
+        .map(r => ({
+          name: r[nameIdx],
+          lat: Number(r[latIdx]),
+          lon: Number(r[lonIdx])
+        }))
+        .filter(h => h.name && Number.isFinite(h.lat) && Number.isFinite(h.lon));
+
+      setStatus(`Loaded ${hydrants.length} hydrants.`);
+      drawAllHydrantsIfEnabled();
+      fitMapToHydrants();
+    } catch (e) {
+      console.error(e);
+      setStatus("Failed to load hydrants. Check console.", true);
     }
-
-    hydrants = rows.slice(1)
-      .map(r => ({
-        name: r[nameIdx],
-        lat: Number(r[latIdx]),
-        lon: Number(r[lonIdx])
-      }))
-      .filter(h => h.name && Number.isFinite(h.lat) && Number.isFinite(h.lon));
-
-    setStatus(`Loaded ${hydrants.length} hydrants.`);
-    drawAllHydrantsIfEnabled();
-    fitMapToHydrants();
   }
 
   function drawAllHydrantsIfEnabled() {
@@ -214,7 +220,7 @@
 
     for (const h of hydrants) {
       L.circleMarker([h.lat, h.lon], {
-        radius: 4, weight: 1, fillOpacity: 0.7
+        radius: 4, weight: 1, fillOpacity: 0.7, color: '#ff0000'
       }).addTo(hydrantLayer)
         .bindPopup(`<b>Hydrant:</b> ${escapeHtml(h.name)}<br>${h.lat.toFixed(6)}, ${h.lon.toFixed(6)}`);
     }
@@ -239,11 +245,11 @@
   }
 
   function plotTop3(top3) {
-    clearTop3();
+    top3Layer.clearLayers();
     for (let i = 0; i < top3.length; i++) {
       const h = top3[i];
       L.circleMarker([h.lat, h.lon], {
-        radius: 8, weight: 2, fillOpacity: 0.85
+        radius: 8, weight: 2, fillOpacity: 0.85, color: '#ff0000'
       }).addTo(top3Layer)
        .bindPopup(`<b>Top ${i+1}:</b> ${escapeHtml(h.name)}<br>${Math.round(metersToFeet(h.distM))} ft`);
     }
@@ -279,6 +285,9 @@
     out.innerHTML = `
       <div class="big"><b>${escapeHtml(title)}</b></div>
       <div class="muted">Origin: ${originLat.toFixed(6)}, ${originLon.toFixed(6)}</div>
+      <div class="btns">
+        <button id="centerBtn" type="button">Center on Origin</button>
+      </div>
       ${items}
       <div class="muted" style="margin-top:8px;">Tip: Tap hydrant dots for info.</div>
     `;
@@ -288,6 +297,10 @@
         const [a,b] = btn.getAttribute("data-zoom").split(",").map(Number);
         map.setView([a,b], 17);
       });
+    });
+
+    document.getElementById("centerBtn").addEventListener("click", () => {
+      if (currentOrigin) map.setView([currentOrigin.lat, currentOrigin.lon], 16);
     });
   }
 
@@ -332,13 +345,16 @@
         .bindPopup(`<b>Incident</b><br>${escapeHtml(hit.display)}`)
         .openPopup();
 
+      // set current origin
+      currentOrigin = { lat: hit.lat, lon: hit.lon, title: hit.display, type: 'incident' };
+
       // rings + top3 to incident
       drawRings(hit.lat, hit.lon);
       showTop3FromPoint(hit.lat, hit.lon, "Top 3 Closest Hydrants to Incident Address");
 
       setStatus(`Found: ${hit.display}`);
     } catch (e) {
-      console.log(e);
+      console.error(e);
       setStatus("Address search failed. Try again.", true);
       alert("Address search failed. Try again.");
     }
@@ -353,6 +369,13 @@
       gpsWatchId = null;
       setStatus("Live GPS stopped.");
       document.getElementById("gpsBtn").textContent = "Start Live GPS (Always Follow)";
+      userLayer.clearLayers();
+      if (currentOrigin && currentOrigin.type === 'gps') {
+        currentOrigin = null;
+        clearRings();
+        top3Layer.clearLayers();
+        document.getElementById("out").style.display = "none";
+      }
     }
   }
 
@@ -370,17 +393,29 @@
       (pos) => {
         const lat = pos.coords.latitude;
         const lon = pos.coords.longitude;
+        const accuracy = pos.coords.accuracy;
 
-        // marker
+        // set current origin
+        currentOrigin = { lat, lon, title: 'Live GPS', type: 'gps' };
+
+        // marker and accuracy circle
         userLayer.clearLayers();
         userMarker = L.marker([lat, lon], { title: "You (GPS)" }).addTo(userLayer)
           .bindPopup("<b>You (Live GPS)</b>");
+        if (accuracy) {
+          userAccuracyCircle = L.circle([lat, lon], { radius: accuracy, weight: 1, fillOpacity: 0.1 }).addTo(userLayer);
+        }
 
         // ALWAYS follow
         map.panTo([lat, lon], { animate: true });
 
+        // Update rings
+        drawRings(lat, lon);
+
         // Update top 3 to apparatus as you move
-        showTop3FromPoint(lat, lon, "Top 3 Closest Hydrants to Your Live GPS");
+        const top3 = computeTop3(lat, lon);
+        plotTop3(top3);
+        showResults("Top 3 Closest Hydrants to Your Live GPS", lat, lon, top3);
 
         // first fix zoom
         if (firstGpsFix) {
@@ -388,10 +423,10 @@
           firstGpsFix = false;
         }
 
-        setStatus("Live GPS updating…");
+        setStatus(`Live GPS updating (accuracy ~${Math.round(metersToFeet(accuracy))} ft)`);
       },
       (err) => {
-        console.log(err);
+        console.error(err);
         setStatus("Could not get live GPS. Check permissions.", true);
         alert("Could not get live GPS. Make sure Location Services + browser permission are allowed.");
         stopGpsWatch();
@@ -414,15 +449,10 @@
   document.getElementById("showAllHydrants").addEventListener("change", drawAllHydrantsIfEnabled);
 
   document.getElementById("ringsToggle").addEventListener("change", () => {
-    if (!document.getElementById("ringsToggle").checked) {
+    if (document.getElementById("ringsToggle").checked && currentOrigin) {
+      drawRings(currentOrigin.lat, currentOrigin.lon);
+    } else {
       clearRings();
-      return;
-    }
-    // redraw if incident exists
-    const layers = incidentLayer.getLayers();
-    if (layers.length) {
-      const ll = layers[0].getLatLng();
-      drawRings(ll.lat, ll.lng);
     }
   });
 
@@ -435,13 +465,7 @@
    * BOOT
    ********************/
   (async function boot() {
-    try {
-      await loadHydrants();
-    } catch (e) {
-      console.log(e);
-      setStatus("Could not load hydrants file. Make sure hydrants_for_google_my_maps.csv is in the repo root.", true);
-      alert("Could not load hydrants file. Make sure hydrants_for_google_my_maps.csv is in the repo root.");
-    }
+    await loadHydrants();
 
     // Auto GPS live tracking
     if (document.getElementById("autoGps").checked) {
