@@ -5,18 +5,19 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>City of Atmore — Hydrant Navigator</title>
 
-  <!-- Leaflet (free map) -->
-  <link
-    rel="stylesheet"
-    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
-    crossorigin=""
-  />
-  <script
-    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
-    crossorigin=""
-  ></script>
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+
+  <!-- Leaflet Routing Machine -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.css" />
+  <script src="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.js"></script>
+
+  <!-- Leaflet Measure (for hose distance tool) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.measure@3.2.2/dist/leaflet-measure.css" />
+  <script src="https://unpkg.com/leaflet.measure@3.2.2/dist/leaflet-measure.js"></script>
 
   <style>
     body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
@@ -34,13 +35,13 @@
     .btns { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
     .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; background:#f2f2f2; font-size: 12px; margin-left: 6px; }
     .warn { color: #8a2b2b; }
-    .two { display:grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .navtwo { display:grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px; }
+    .route-info { background: #e3f2fd; padding: 8px; border-radius: 8px; font-weight: bold; color: #1565c0; }
     a { text-decoration:none; }
   </style>
 </head>
-
 <body>
+
 <header>
   <h1>City of Atmore — Hydrant Navigator</h1>
 
@@ -51,6 +52,7 @@
 
   <div class="row" style="margin-top:10px;">
     <button id="gpsBtn" type="button">Start Live GPS (Always Follow)</button>
+    <button id="measureBtn" type="button">Measure Hose Distance</button>
 
     <label><input id="autoGps" type="checkbox" checked /> Auto GPS on open</label>
     <label><input id="ringsToggle" type="checkbox" checked /> 300/600/1000 ft rings</label>
@@ -66,23 +68,18 @@
 
 <div class="panel">
   <div class="muted">Results</div>
+  <div id="routeInfo" class="route-info" style="display:none; margin-bottom:8px;"></div>
   <div id="out" class="card" style="display:none;"></div>
 </div>
 
 <script>
-  /********************
-   * CONFIG
-   ********************/
-  const HYDRANT_CSV_URL = "hydrants_for_google_my_maps.csv"; // must exist in repo root
+  /* CONFIG */
+  const HYDRANT_CSV_URL = "hydrants_for_google_my_maps.csv";
   const NOMINATIM_URL = "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=";
-
-  // fallback center (Atmore-ish)
   const DEFAULT_CENTER = [31.023, -87.493];
   const DEFAULT_ZOOM = 13;
 
-  /********************
-   * MAP SETUP
-   ********************/
+  /* MAP SETUP */
   const map = L.map("map", { zoomControl: true }).setView(DEFAULT_CENTER, DEFAULT_ZOOM);
 
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -95,66 +92,92 @@
   const incidentLayer = L.layerGroup().addTo(map);
   const userLayer     = L.layerGroup().addTo(map);
   const ringsLayer    = L.layerGroup().addTo(map);
+  const routeLayer    = L.layerGroup().addTo(map);
 
-  let hydrants = []; // {name, lat, lon}
+  let hydrants = [];
   let gpsWatchId = null;
   let userMarker = null;
   let userAccuracyCircle = null;
   let firstGpsFix = true;
-  let currentOrigin = null; // {lat, lon, title, type: 'incident' or 'gps'}
+  let currentOrigin = null;
+  let currentRouteControl = null;
+  let measureControl = null;
+  let isMeasuring = false;
 
-  function setStatus(msg, warn=false) {
+  function setStatus(msg, warn = false) {
     const el = document.getElementById("statusLine");
     el.textContent = msg || "";
     el.className = "muted" + (warn ? " warn" : "");
   }
 
-  /********************
-   * UTILITIES
-   ********************/
+  /* UTILITIES */
   function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, (c) => ({
-      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
-    }[c]));
+    return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[c]));
   }
 
-  function toRad(x){ return x * Math.PI / 180; }
+  function toRad(x) { return x * Math.PI / 180; }
 
   function haversineMeters(lat1, lon1, lat2, lon2) {
     const R = 6371000;
     const dLat = toRad(lat2 - lat1);
     const dLon = toRad(lon2 - lon1);
-    const a =
-      Math.sin(dLat / 2) ** 2 +
-      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+    const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
     return 2 * R * Math.asin(Math.sqrt(a));
   }
 
   function metersToFeet(m) { return m * 3.28084; }
   function ftToMeters(ft) { return ft * 0.3048; }
 
-  function googleNavLink(lat, lon) {
-    return `https://www.google.com/maps/dir/?api=1&destination=${lat},${lon}&travelmode=driving`;
-  }
-
-  function appleNavLink(lat, lon) {
-    return `https://maps.apple.com/?daddr=${lat},${lon}&dirflg=d`;
-  }
+  function googleNavLink(lat, lon) { return `https://www.google.com/maps/dir/?api=1&destination=${lat},${lon}&travelmode=driving`; }
+  function appleNavLink(lat, lon) { return `https://maps.apple.com/?daddr=${lat},${lon}&dirflg=d`; }
 
   function clearRings() { ringsLayer.clearLayers(); }
 
   function drawRings(lat, lon) {
     clearRings();
     if (!document.getElementById("ringsToggle").checked || !lat || !lon) return;
-
     L.circle([lat, lon], { radius: ftToMeters(300),  weight: 2, fillOpacity: 0.03, color: '#888' }).addTo(ringsLayer);
     L.circle([lat, lon], { radius: ftToMeters(600),  weight: 2, fillOpacity: 0.02, color: '#888' }).addTo(ringsLayer);
     L.circle([lat, lon], { radius: ftToMeters(1000), weight: 2, fillOpacity: 0.01, color: '#888' }).addTo(ringsLayer);
   }
 
-  /********************
-   * CSV PARSER (handles quotes)
-   ********************/
+  function clearRoute() {
+    if (currentRouteControl) {
+      map.removeControl(currentRouteControl);
+      currentRouteControl = null;
+    }
+    routeLayer.clearLayers();
+    document.getElementById("routeInfo").style.display = "none";
+  }
+
+  function drawRouteFromUserToIncident(userLat, userLon, incidentLat, incidentLon) {
+    clearRoute();
+    if (!userLat || !incidentLat) return;
+
+    currentRouteControl = L.Routing.control({
+      waypoints: [
+        L.latLng(userLat, userLon),
+        L.latLng(incidentLat, incidentLon)
+      ],
+      routeWhileDragging: false,
+      addWaypoints: false,
+      draggableWaypoints: false,
+      createMarker: () => null,
+      lineOptions: { styles: [{ color: '#3388ff', weight: 6, opacity: 0.8 }] },
+      show: false,
+      router: L.Routing.osrmv1({
+        serviceUrl: 'https://router.project-osrm.org/route/v1/driving'
+      })
+    }).on('routesfound', function(e) {
+      const route = e.routes[0];
+      const minutes = Math.round(route.summary.totalTime / 60);
+      const miles = (route.summary.totalDistance / 1609.34).toFixed(1);
+      document.getElementById("routeInfo").innerHTML = `En route: ${minutes} min · ${miles} miles`;
+      document.getElementById("routeInfo").style.display = "block";
+    }).addTo(map);
+  }
+
+  /* CSV & HYDRANTS */
   function parseCSV(text) {
     const rows = [];
     let row = [];
@@ -163,16 +186,16 @@
 
     for (let i = 0; i < text.length; i++) {
       const c = text[i];
-      const next = text[i+1];
+      const next = text[i + 1];
 
       if (c === '"' && inQuotes && next === '"') { cur += '"'; i++; }
-      else if (c === '"') { inQuotes = !inQuotes; }
+      else if (c === '"') inQuotes = !inQuotes;
       else if (c === "," && !inQuotes) { row.push(cur.trim()); cur = ""; }
       else if ((c === "\n" || c === "\r") && !inQuotes) {
         if (cur.length || row.length) { row.push(cur.trim()); rows.push(row); }
         row = []; cur = "";
         if (c === "\r" && next === "\n") i++;
-      } else { cur += c; }
+      } else cur += c;
     }
     if (cur.length || row.length) { row.push(cur.trim()); rows.push(row); }
     return rows;
@@ -186,23 +209,18 @@
       const text = await res.text();
 
       const rows = parseCSV(text);
-      if (rows.length < 2) throw new Error("CSV is empty or invalid.");
+      if (rows.length < 2) throw new Error("CSV empty or invalid.");
 
       const header = rows[0].map(h => h.toLowerCase());
       const nameIdx = header.indexOf("name");
       const latIdx  = header.indexOf("latitude");
       const lonIdx  = header.indexOf("longitude");
 
-      if (nameIdx === -1 || latIdx === -1 || lonIdx === -1) {
+      if (nameIdx === -1 || latIdx === -1 || lonIdx === -1)
         throw new Error("CSV must have columns: Name, Latitude, Longitude.");
-      }
 
       hydrants = rows.slice(1)
-        .map(r => ({
-          name: r[nameIdx],
-          lat: Number(r[latIdx]),
-          lon: Number(r[lonIdx])
-        }))
+        .map(r => ({ name: r[nameIdx], lat: Number(r[latIdx]), lon: Number(r[lonIdx]) }))
         .filter(h => h.name && Number.isFinite(h.lat) && Number.isFinite(h.lon));
 
       setStatus(`Loaded ${hydrants.length} hydrants.`);
@@ -220,7 +238,7 @@
 
     for (const h of hydrants) {
       L.circleMarker([h.lat, h.lon], {
-        radius: 4, weight: 1, fillOpacity: 0.7, color: '#ff0000'
+        radius: 4, weight: 1, fillOpacity: 0.7, color: '#d00', fillColor: '#f33'
       }).addTo(hydrantLayer)
         .bindPopup(`<b>Hydrant:</b> ${escapeHtml(h.name)}<br>${h.lat.toFixed(6)}, ${h.lon.toFixed(6)}`);
     }
@@ -232,15 +250,10 @@
     map.fitBounds(bounds.pad(0.08));
   }
 
-  /********************
-   * TOP 3 LOGIC
-   ********************/
+  /* TOP 3 */
   function computeTop3(lat, lon) {
-    const scored = hydrants.map(h => ({
-      ...h,
-      distM: haversineMeters(lat, lon, h.lat, h.lon)
-    }));
-    scored.sort((a,b) => a.distM - b.distM);
+    const scored = hydrants.map(h => ({ ...h, distM: haversineMeters(lat, lon, h.lat, h.lon) }));
+    scored.sort((a, b) => a.distM - b.distM);
     return scored.slice(0, 3);
   }
 
@@ -249,7 +262,7 @@
     for (let i = 0; i < top3.length; i++) {
       const h = top3[i];
       L.circleMarker([h.lat, h.lon], {
-        radius: 8, weight: 2, fillOpacity: 0.85, color: '#ff0000'
+        radius: 9, weight: 3, fillOpacity: 0.9, color: '#d00', fillColor: '#ff4444'
       }).addTo(top3Layer)
        .bindPopup(`<b>Top ${i+1}:</b> ${escapeHtml(h.name)}<br>${Math.round(metersToFeet(h.distM))} ft`);
     }
@@ -265,41 +278,29 @@
         <div class="card" style="margin-top:8px;">
           <div class="big"><b>#${idx+1} ${escapeHtml(h.name)}</b> <span class="pill">${ft} ft</span></div>
           <div class="muted">${h.lat.toFixed(6)}, ${h.lon.toFixed(6)}</div>
-
           <div class="navtwo">
-            <a href="${googleNavLink(h.lat, h.lon)}" target="_blank" rel="noopener">
-              <button type="button">Navigate (Google)</button>
-            </a>
-            <a href="${appleNavLink(h.lat, h.lon)}" target="_blank" rel="noopener">
-              <button type="button">Navigate (Apple)</button>
-            </a>
+            <a href="${googleNavLink(h.lat, h.lon)}" target="_blank" rel="noopener"><button>Navigate (Google)</button></a>
+            <a href="${appleNavLink(h.lat, h.lon)}" target="_blank" rel="noopener"><button>Navigate (Apple)</button></a>
           </div>
-
-          <div class="btns">
-            <button type="button" data-zoom="${h.lat},${h.lon}">Zoom to Hydrant</button>
-          </div>
-        </div>
-      `;
+          <div class="btns"><button data-zoom="${h.lat},${h.lon}">Zoom to Hydrant</button></div>
+        </div>`;
     }).join("");
 
     out.innerHTML = `
       <div class="big"><b>${escapeHtml(title)}</b></div>
       <div class="muted">Origin: ${originLat.toFixed(6)}, ${originLon.toFixed(6)}</div>
-      <div class="btns">
-        <button id="centerBtn" type="button">Center on Origin</button>
-      </div>
+      <div class="btns"><button id="centerBtn">Center on Origin</button></div>
       ${items}
-      <div class="muted" style="margin-top:8px;">Tip: Tap hydrant dots for info.</div>
-    `;
+      <div class="muted" style="margin-top:8px;">Tip: Tap markers for info. Blue line = route from you to incident.</div>`;
 
     out.querySelectorAll("button[data-zoom]").forEach(btn => {
       btn.addEventListener("click", () => {
-        const [a,b] = btn.getAttribute("data-zoom").split(",").map(Number);
-        map.setView([a,b], 17);
+        const [a, b] = btn.dataset.zoom.split(",").map(Number);
+        map.setView([a, b], 17);
       });
     });
 
-    document.getElementById("centerBtn").addEventListener("click", () => {
+    document.getElementById("centerBtn")?.addEventListener("click", () => {
       if (currentOrigin) map.setView([currentOrigin.lat, currentOrigin.lon], 16);
     });
   }
@@ -309,17 +310,14 @@
     const top3 = computeTop3(lat, lon);
     plotTop3(top3);
     showResults(title, lat, lon, top3);
-
     const pts = [[lat, lon], ...top3.map(h => [h.lat, h.lon])];
     map.fitBounds(L.latLngBounds(pts).pad(0.18));
   }
 
-  /********************
-   * INCIDENT SEARCH
-   ********************/
+  /* INCIDENT SEARCH */
   async function geocodeAddress(query) {
     const url = NOMINATIM_URL + encodeURIComponent(query);
-    const res = await fetch(url, { headers: { "Accept": "application/json" } });
+    const res = await fetch(url);
     if (!res.ok) throw new Error("Geocoding failed.");
     const data = await res.json();
     if (!data || !data.length) return null;
@@ -327,42 +325,41 @@
   }
 
   async function handleFindAddress() {
+    clearRoute();
     const q = document.getElementById("addr").value.trim();
     if (!q) return alert("Enter an address first.");
 
     setStatus("Searching address…");
     try {
       const hit = await geocodeAddress(q);
-      if (!hit || !Number.isFinite(hit.lat) || !Number.isFinite(hit.lon)) {
+      if (!hit) {
         setStatus("Address not found. Try adding 'Atmore, AL'.", true);
         alert("Address not found. Try adding 'Atmore, AL'.");
         return;
       }
 
-      // incident marker
       incidentLayer.clearLayers();
       L.marker([hit.lat, hit.lon], { title: "Incident" }).addTo(incidentLayer)
-        .bindPopup(`<b>Incident</b><br>${escapeHtml(hit.display)}`)
-        .openPopup();
+        .bindPopup(`<b>Incident</b><br>${escapeHtml(hit.display)}`).openPopup();
 
-      // set current origin
       currentOrigin = { lat: hit.lat, lon: hit.lon, title: hit.display, type: 'incident' };
 
-      // rings + top3 to incident
       drawRings(hit.lat, hit.lon);
       showTop3FromPoint(hit.lat, hit.lon, "Top 3 Closest Hydrants to Incident Address");
+
+      if (gpsWatchId !== null && userMarker) {
+        const userPos = userMarker.getLatLng();
+        drawRouteFromUserToIncident(userPos.lat, userPos.lng, hit.lat, hit.lon);
+      }
 
       setStatus(`Found: ${hit.display}`);
     } catch (e) {
       console.error(e);
-      setStatus("Address search failed. Try again.", true);
-      alert("Address search failed. Try again.");
+      setStatus("Address search failed.", true);
     }
   }
 
-  /********************
-   * LIVE GPS (Always follow)
-   ********************/
+  /* LIVE GPS */
   function stopGpsWatch() {
     if (gpsWatchId !== null) {
       navigator.geolocation.clearWatch(gpsWatchId);
@@ -370,7 +367,8 @@
       setStatus("Live GPS stopped.");
       document.getElementById("gpsBtn").textContent = "Start Live GPS (Always Follow)";
       userLayer.clearLayers();
-      if (currentOrigin && currentOrigin.type === 'gps') {
+      clearRoute();
+      if (currentOrigin?.type === 'gps') {
         currentOrigin = null;
         clearRings();
         top3Layer.clearLayers();
@@ -380,97 +378,88 @@
   }
 
   function startGpsWatch() {
-    if (!navigator.geolocation) {
-      alert("GPS not available on this device/browser.");
-      return;
-    }
-    if (gpsWatchId !== null) return; // already running
+    if (!navigator.geolocation) return alert("GPS not available on this device/browser.");
+    if (gpsWatchId !== null) return;
 
     setStatus("Starting live GPS…");
     document.getElementById("gpsBtn").textContent = "Stop Live GPS";
 
     gpsWatchId = navigator.geolocation.watchPosition(
-      (pos) => {
+      pos => {
         const lat = pos.coords.latitude;
         const lon = pos.coords.longitude;
-        const accuracy = pos.coords.accuracy;
+        const accuracy = pos.coords.accuracy || 0;
 
-        // set current origin
         currentOrigin = { lat, lon, title: 'Live GPS', type: 'gps' };
 
-        // marker and accuracy circle
         userLayer.clearLayers();
         userMarker = L.marker([lat, lon], { title: "You (GPS)" }).addTo(userLayer)
           .bindPopup("<b>You (Live GPS)</b>");
-        if (accuracy) {
-          userAccuracyCircle = L.circle([lat, lon], { radius: accuracy, weight: 1, fillOpacity: 0.1 }).addTo(userLayer);
-        }
+        if (accuracy > 0)
+          userAccuracyCircle = L.circle([lat, lon], { radius: accuracy, weight: 1, fillOpacity: 0.1, color: '#3388ff' }).addTo(userLayer);
 
-        // ALWAYS follow
         map.panTo([lat, lon], { animate: true });
 
-        // Update rings
         drawRings(lat, lon);
+        showTop3FromPoint(lat, lon, "Top 3 Closest Hydrants to Your Live GPS");
 
-        // Update top 3 to apparatus as you move
-        const top3 = computeTop3(lat, lon);
-        plotTop3(top3);
-        showResults("Top 3 Closest Hydrants to Your Live GPS", lat, lon, top3);
-
-        // first fix zoom
-        if (firstGpsFix) {
-          map.setView([lat, lon], 16);
-          firstGpsFix = false;
+        if (incidentLayer.getLayers().length > 0) {
+          const inc = incidentLayer.getLayers()[0].getLatLng();
+          drawRouteFromUserToIncident(lat, lon, inc.lat, inc.lng);
         }
 
-        setStatus(`Live GPS updating (accuracy ~${Math.round(metersToFeet(accuracy))} ft)`);
+        if (firstGpsFix) { map.setView([lat, lon], 16); firstGpsFix = false; }
+
+        setStatus(`Live GPS active (accuracy ~${Math.round(metersToFeet(accuracy))} ft)`);
       },
-      (err) => {
+      err => {
         console.error(err);
-        setStatus("Could not get live GPS. Check permissions.", true);
-        alert("Could not get live GPS. Make sure Location Services + browser permission are allowed.");
+        setStatus("GPS error. Check permissions.", true);
+        alert("GPS failed. Ensure location permissions are granted.");
         stopGpsWatch();
       },
       { enableHighAccuracy: true, maximumAge: 1000, timeout: 12000 }
     );
   }
 
-  /********************
-   * EVENTS
-   ********************/
-  document.getElementById("findBtn").addEventListener("click", handleFindAddress);
-
-  // Tap GPS button to start/stop
-  document.getElementById("gpsBtn").addEventListener("click", () => {
-    if (gpsWatchId === null) startGpsWatch();
-    else stopGpsWatch();
-  });
-
-  document.getElementById("showAllHydrants").addEventListener("change", drawAllHydrantsIfEnabled);
-
-  document.getElementById("ringsToggle").addEventListener("change", () => {
-    if (document.getElementById("ringsToggle").checked && currentOrigin) {
-      drawRings(currentOrigin.lat, currentOrigin.lon);
+  /* MEASURE TOOL */
+  function toggleMeasure() {
+    if (isMeasuring) {
+      if (measureControl) map.removeControl(measureControl);
+      isMeasuring = false;
+      document.getElementById("measureBtn").textContent = "Measure Hose Distance";
+      setStatus("Measure tool off.");
     } else {
-      clearRings();
+      measureControl = new L.Control.Measure({
+        position: 'topleft',
+        primaryLengthUnit: 'feet',
+        secondaryLengthUnit: 'meters',
+        primaryAreaUnit: 'sqfeet',
+        activeColor: '#d00',
+        completedColor: '#d00'
+      });
+      measureControl.addTo(map);
+      isMeasuring = true;
+      document.getElementById("measureBtn").textContent = "Stop Measuring";
+      setStatus("Measuring: Click points on map for distance (great for hose lays).");
     }
-  });
+  }
 
-  // Enter key triggers address search
-  document.getElementById("addr").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") handleFindAddress();
+  /* EVENTS */
+  document.getElementById("findBtn").addEventListener("click", handleFindAddress);
+  document.getElementById("gpsBtn").addEventListener("click", () => gpsWatchId === null ? startGpsWatch() : stopGpsWatch());
+  document.getElementById("measureBtn").addEventListener("click", toggleMeasure);
+  document.getElementById("showAllHydrants").addEventListener("change", drawAllHydrantsIfEnabled);
+  document.getElementById("ringsToggle").addEventListener("change", () => {
+    if (document.getElementById("ringsToggle").checked && currentOrigin) drawRings(currentOrigin.lat, currentOrigin.lon);
+    else clearRings();
   });
+  document.getElementById("addr").addEventListener("keydown", e => { if (e.key === "Enter") handleFindAddress(); });
 
-  /********************
-   * BOOT
-   ********************/
-  (async function boot() {
+  /* BOOT */
+  (async () => {
     await loadHydrants();
-
-    // Auto GPS live tracking
-    if (document.getElementById("autoGps").checked) {
-      startGpsWatch();
-    }
+    if (document.getElementById("autoGps").checked) startGpsWatch();
   })();
 </script>
 
