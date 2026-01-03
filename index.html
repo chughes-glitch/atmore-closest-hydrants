@@ -11,13 +11,9 @@
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
     integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 
-  <!-- Leaflet Routing Machine -->
+  <!-- Leaflet Routing Machine (for blue route) -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.css" />
   <script src="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.js"></script>
-
-  <!-- Leaflet Measure -->
-  <link rel="stylesheet" href="https://unpkg.com/leaflet.measure@3.2.2/dist/leaflet-measure.css" />
-  <script src="https://unpkg.com/leaflet.measure@3.2.2/dist/leaflet-measure.js"></script>
 
   <style>
     body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
@@ -36,7 +32,6 @@
     .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; background:#f2f2f2; font-size: 12px; margin-left: 6px; }
     .warn { color: #8a2b2b; }
     .navtwo { display:grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px; }
-    .route-info { background: #e3f2fd; padding: 8px; border-radius: 8px; font-weight: bold; color: #1565c0; }
     a { text-decoration:none; }
   </style>
 </head>
@@ -52,7 +47,6 @@
 
   <div class="row" style="margin-top:10px;">
     <button id="gpsBtn" type="button">Start Live GPS (Always Follow)</button>
-    <button id="measureBtn" type="button">Measure Hose Distance</button>
 
     <label><input id="autoGps" type="checkbox" checked /> Auto GPS on open</label>
     <label><input id="ringsToggle" type="checkbox" checked /> 300/600/1000 ft rings</label>
@@ -68,14 +62,10 @@
 
 <div class="panel">
   <div class="muted">Results</div>
-  <div id="routeInfo" class="route-info" style="display:none; margin-bottom:8px;"></div>
   <div id="out" class="card" style="display:none;"></div>
 </div>
 
 <script>
-  /* MAPBOX TOKEN (your token is already inserted) */
-  const MAPBOX_ACCESS_TOKEN = 'pk.eyJ1IjoiY2h1Z2hlczU0MiIsImEiOiJjbWp4cnNoNXg1eGx5M2ZvYmU3MjVxMnJwIn0.PMa8r_GpVy_cq_FyZ9nxag';
-
   /* CONFIG */
   const HYDRANT_CSV_URL = "hydrants_for_google_my_maps.csv";
   const NOMINATIM_URL = "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=";
@@ -102,11 +92,8 @@
   let userMarker = null;
   let userAccuracyCircle = null;
   let firstGpsFix = true;
-  let currentOrigin = null;
+  let currentOrigin = null; // {lat, lon, title, type: 'incident' or 'gps'}
   let currentRouteControl = null;
-  let fallbackRouteLine = null;
-  let measureControl = null;
-  let isMeasuring = false;
 
   function setStatus(msg, warn = false) {
     const el = document.getElementById("statusLine");
@@ -114,48 +101,63 @@
     el.className = "muted" + (warn ? " warn" : "");
   }
 
-  /* ROUTING WITH MAPBOX */
+  /* UTILITIES */
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[c]));
+  }
+
+  function toRad(x) { return x * Math.PI / 180; }
+
+  function haversineMeters(lat1, lon1, lat2, lon2) {
+    const R = 6371000;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(a));
+  }
+
+  function metersToFeet(m) { return m * 3.28084; }
+  function ftToMeters(ft) { return ft * 0.3048; }
+
+  function googleNavLink(lat, lon) { return `https://www.google.com/maps/dir/?api=1&destination=${lat},${lon}&travelmode=driving`; }
+  function appleNavLink(lat, lon) { return `https://maps.apple.com/?daddr=${lat},${lon}&dirflg=d`; }
+
+  function clearRings() { ringsLayer.clearLayers(); }
+
+  function drawRings(lat, lon) {
+    clearRings();
+    if (!document.getElementById("ringsToggle").checked || !lat || !lon) return;
+    L.circle([lat, lon], { radius: ftToMeters(300),  weight: 2, fillOpacity: 0.03, color: '#888' }).addTo(ringsLayer);
+    L.circle([lat, lon], { radius: ftToMeters(600),  weight: 2, fillOpacity: 0.02, color: '#888' }).addTo(ringsLayer);
+    L.circle([lat, lon], { radius: ftToMeters(1000), weight: 2, fillOpacity: 0.01, color: '#888' }).addTo(ringsLayer);
+  }
+
   function clearRoute() {
     if (currentRouteControl) {
       map.removeControl(currentRouteControl);
       currentRouteControl = null;
     }
-    if (fallbackRouteLine) {
-      routeLayer.removeLayer(fallbackRouteLine);
-      fallbackRouteLine = null;
-    }
-    document.getElementById("routeInfo").style.display = "none";
-  }
-
-  function drawFallbackRoute(userLat, userLon, incidentLat, incidentLon) {
-    clearRoute();
-    fallbackRouteLine = L.polyline([[userLat, userLon], [incidentLat, incidentLon]], {
-      color: '#3388ff', weight: 6, opacity: 0.8
-    }).addTo(routeLayer);
-    document.getElementById("routeInfo").innerHTML = "En route: Straight-line (fallback)";
-    document.getElementById("routeInfo").style.display = "block";
+    routeLayer.clearLayers();
   }
 
   function drawRouteFromUserToIncident(userLat, userLon, incidentLat, incidentLon) {
     clearRoute();
+    if (!userLat || !incidentLat) return;
 
     currentRouteControl = L.Routing.control({
-      waypoints: [L.latLng(userLat, userLon), L.latLng(incidentLat, incidentLon)],
+      waypoints: [
+        L.latLng(userLat, userLon),
+        L.latLng(incidentLat, incidentLon)
+      ],
       routeWhileDragging: false,
       addWaypoints: false,
       draggableWaypoints: false,
       createMarker: () => null,
       lineOptions: { styles: [{ color: '#3388ff', weight: 6, opacity: 0.8 }] },
       show: false,
-      router: L.Routing.mapbox(MAPBOX_ACCESS_TOKEN, { profile: 'mapbox/driving' })
-    }).on('routesfound', e => {
-      const route = e.routes[0];
-      const minutes = Math.round(route.summary.totalTime / 60);
-      const miles = (route.summary.totalDistance / 1609.34).toFixed(1);
-      document.getElementById("routeInfo").innerHTML = `En route: ${minutes} min · ${miles} miles`;
-      document.getElementById("routeInfo").style.display = "block";
-    }).on('routingerror', () => {
-      drawFallbackRoute(userLat, userLon, incidentLat, incidentLon);
+      router: L.Routing.osrmv1({
+        serviceUrl: 'https://router.project-osrm.org/route/v1/driving'
+      })
     }).addTo(map);
   }
 
@@ -169,6 +171,7 @@
     for (let i = 0; i < text.length; i++) {
       const c = text[i];
       const next = text[i + 1];
+
       if (c === '"' && inQuotes && next === '"') { cur += '"'; i++; }
       else if (c === '"') inQuotes = !inQuotes;
       else if (c === "," && !inQuotes) { row.push(cur.trim()); cur = ""; }
@@ -231,7 +234,7 @@
     map.fitBounds(bounds.pad(0.08));
   }
 
-  /* TOP 3 LOGIC */
+  /* TOP 3 */
   function computeTop3(lat, lon) {
     const scored = hydrants.map(h => ({ ...h, distM: haversineMeters(lat, lon, h.lat, h.lon) }));
     scored.sort((a, b) => a.distM - b.distM);
@@ -272,7 +275,7 @@
       <div class="muted">Origin: ${originLat.toFixed(6)}, ${originLon.toFixed(6)}</div>
       <div class="btns"><button id="centerBtn">Center on Origin</button></div>
       ${items}
-      <div class="muted" style="margin-top:8px;">Tip: Tap markers for info. Blue line = route from you to incident.</div>`;
+      <div class="muted" style="margin-top:8px;">Tip: Tap markers for info. Blue line = route from you to incident (when both active).</div>`;
 
     out.querySelectorAll("button[data-zoom]").forEach(btn => {
       btn.addEventListener("click", () => {
@@ -403,62 +406,9 @@
     );
   }
 
-  /* MEASURE TOOL */
-  function toggleMeasure() {
-    if (isMeasuring) {
-      if (measureControl) map.removeControl(measureControl);
-      isMeasuring = false;
-      document.getElementById("measureBtn").textContent = "Measure Hose Distance";
-      setStatus("Measure tool off.");
-    } else {
-      measureControl = new L.Control.Measure({
-        position: 'topleft',
-        primaryLengthUnit: 'feet',
-        secondaryLengthUnit: 'meters',
-        primaryAreaUnit: 'sqfeet',
-        activeColor: '#d00',
-        completedColor: '#d00'
-      });
-      measureControl.addTo(map);
-      isMeasuring = true;
-      document.getElementById("measureBtn").textContent = "Stop Measuring";
-      setStatus("Measuring: Click points on map for distance (great for hose lays).");
-    }
-  }
-
-  /* UTILITIES (haversine, escapeHtml, links, rings) */
-  function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[c]));
-  }
-
-  function haversineMeters(lat1, lon1, lat2, lon2) {
-    const R = 6371000;
-    const dLat = (lat2 - lat1) * Math.PI / 180;
-    const dLon = (lon2 - lon1) * Math.PI / 180;
-    const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
-    return 2 * R * Math.asin(Math.sqrt(a));
-  }
-
-  function metersToFeet(m) { return m * 3.28084; }
-  function ftToMeters(ft) { return ft * 0.3048; }
-
-  function googleNavLink(lat, lon) { return `https://www.google.com/maps/dir/?api=1&destination=${lat},${lon}&travelmode=driving`; }
-  function appleNavLink(lat, lon) { return `https://maps.apple.com/?daddr=${lat},${lon}&dirflg=d`; }
-
-  function clearRings() { ringsLayer.clearLayers(); }
-
-  function drawRings(lat, lon) {
-    clearRings();
-    if (!document.getElementById("ringsToggle").checked || !lat || !lon) return;
-    L.circle([lat, lon], { radius: ftToMeters(300), weight: 2, fillOpacity: 0.03, color: '#888' }).addTo(ringsLayer);
-    L.circle([lat, lon], { radius: ftToMeters(600), weight: 2, fillOpacity: 0.02, color: '#888' }).addTo(ringsLayer);
-    L.circle([lat, lon], { radius: ftToMeters(1000), weight: 2, fillOpacity: 0.01, color: '#888' }).addTo(ringsLayer);
-  }
-
   /* EVENTS */
   document.getElementById("findBtn").addEventListener("click", handleFindAddress);
   document.getElementById("gpsBtn").addEventListener("click", () => gpsWatchId === null ? startGpsWatch() : stopGpsWatch());
-  document.getElementById("measureBtn").addEventListener("click", toggleMeasure);
   document.getElementById("showAllHydrants").addEventListener("change", drawAllHydrantsIfEnabled);
   document.getElementById("ringsToggle").addEventListener("change", () => {
     if (document.getElementById("ringsToggle").checked && currentOrigin) drawRings(currentOrigin.lat, currentOrigin.lon);
