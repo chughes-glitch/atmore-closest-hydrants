@@ -15,7 +15,7 @@
   <link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.css" />
   <script src="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.js"></script>
 
-  <!-- Leaflet Measure (for hose distance tool) -->
+  <!-- Leaflet Measure -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet.measure@3.2.2/dist/leaflet-measure.css" />
   <script src="https://unpkg.com/leaflet.measure@3.2.2/dist/leaflet-measure.js"></script>
 
@@ -73,6 +73,9 @@
 </div>
 
 <script>
+  /* MAPBOX TOKEN (your token is already inserted) */
+  const MAPBOX_ACCESS_TOKEN = 'pk.eyJ1IjoiY2h1Z2hlczU0MiIsImEiOiJjbWp4cnNoNXg1eGx5M2ZvYmU3MjVxMnJwIn0.PMa8r_GpVy_cq_FyZ9nxag';
+
   /* CONFIG */
   const HYDRANT_CSV_URL = "hydrants_for_google_my_maps.csv";
   const NOMINATIM_URL = "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=";
@@ -101,6 +104,7 @@
   let firstGpsFix = true;
   let currentOrigin = null;
   let currentRouteControl = null;
+  let fallbackRouteLine = null;
   let measureControl = null;
   let isMeasuring = false;
 
@@ -110,74 +114,52 @@
     el.className = "muted" + (warn ? " warn" : "");
   }
 
-  /* UTILITIES */
-  function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[c]));
-  }
-
-  function toRad(x) { return x * Math.PI / 180; }
-
-  function haversineMeters(lat1, lon1, lat2, lon2) {
-    const R = 6371000;
-    const dLat = toRad(lat2 - lat1);
-    const dLon = toRad(lon2 - lon1);
-    const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
-    return 2 * R * Math.asin(Math.sqrt(a));
-  }
-
-  function metersToFeet(m) { return m * 3.28084; }
-  function ftToMeters(ft) { return ft * 0.3048; }
-
-  function googleNavLink(lat, lon) { return `https://www.google.com/maps/dir/?api=1&destination=${lat},${lon}&travelmode=driving`; }
-  function appleNavLink(lat, lon) { return `https://maps.apple.com/?daddr=${lat},${lon}&dirflg=d`; }
-
-  function clearRings() { ringsLayer.clearLayers(); }
-
-  function drawRings(lat, lon) {
-    clearRings();
-    if (!document.getElementById("ringsToggle").checked || !lat || !lon) return;
-    L.circle([lat, lon], { radius: ftToMeters(300),  weight: 2, fillOpacity: 0.03, color: '#888' }).addTo(ringsLayer);
-    L.circle([lat, lon], { radius: ftToMeters(600),  weight: 2, fillOpacity: 0.02, color: '#888' }).addTo(ringsLayer);
-    L.circle([lat, lon], { radius: ftToMeters(1000), weight: 2, fillOpacity: 0.01, color: '#888' }).addTo(ringsLayer);
-  }
-
+  /* ROUTING WITH MAPBOX */
   function clearRoute() {
     if (currentRouteControl) {
       map.removeControl(currentRouteControl);
       currentRouteControl = null;
     }
-    routeLayer.clearLayers();
+    if (fallbackRouteLine) {
+      routeLayer.removeLayer(fallbackRouteLine);
+      fallbackRouteLine = null;
+    }
     document.getElementById("routeInfo").style.display = "none";
+  }
+
+  function drawFallbackRoute(userLat, userLon, incidentLat, incidentLon) {
+    clearRoute();
+    fallbackRouteLine = L.polyline([[userLat, userLon], [incidentLat, incidentLon]], {
+      color: '#3388ff', weight: 6, opacity: 0.8
+    }).addTo(routeLayer);
+    document.getElementById("routeInfo").innerHTML = "En route: Straight-line (fallback)";
+    document.getElementById("routeInfo").style.display = "block";
   }
 
   function drawRouteFromUserToIncident(userLat, userLon, incidentLat, incidentLon) {
     clearRoute();
-    if (!userLat || !incidentLat) return;
 
     currentRouteControl = L.Routing.control({
-      waypoints: [
-        L.latLng(userLat, userLon),
-        L.latLng(incidentLat, incidentLon)
-      ],
+      waypoints: [L.latLng(userLat, userLon), L.latLng(incidentLat, incidentLon)],
       routeWhileDragging: false,
       addWaypoints: false,
       draggableWaypoints: false,
       createMarker: () => null,
       lineOptions: { styles: [{ color: '#3388ff', weight: 6, opacity: 0.8 }] },
       show: false,
-      router: L.Routing.osrmv1({
-        serviceUrl: 'https://router.project-osrm.org/route/v1/driving'
-      })
-    }).on('routesfound', function(e) {
+      router: L.Routing.mapbox(MAPBOX_ACCESS_TOKEN, { profile: 'mapbox/driving' })
+    }).on('routesfound', e => {
       const route = e.routes[0];
       const minutes = Math.round(route.summary.totalTime / 60);
       const miles = (route.summary.totalDistance / 1609.34).toFixed(1);
       document.getElementById("routeInfo").innerHTML = `En route: ${minutes} min · ${miles} miles`;
       document.getElementById("routeInfo").style.display = "block";
+    }).on('routingerror', () => {
+      drawFallbackRoute(userLat, userLon, incidentLat, incidentLon);
     }).addTo(map);
   }
 
-  /* CSV & HYDRANTS */
+  /* CSV PARSER */
   function parseCSV(text) {
     const rows = [];
     let row = [];
@@ -187,7 +169,6 @@
     for (let i = 0; i < text.length; i++) {
       const c = text[i];
       const next = text[i + 1];
-
       if (c === '"' && inQuotes && next === '"') { cur += '"'; i++; }
       else if (c === '"') inQuotes = !inQuotes;
       else if (c === "," && !inQuotes) { row.push(cur.trim()); cur = ""; }
@@ -250,7 +231,7 @@
     map.fitBounds(bounds.pad(0.08));
   }
 
-  /* TOP 3 */
+  /* TOP 3 LOGIC */
   function computeTop3(lat, lon) {
     const scored = hydrants.map(h => ({ ...h, distM: haversineMeters(lat, lon, h.lat, h.lon) }));
     scored.sort((a, b) => a.distM - b.distM);
@@ -443,6 +424,35 @@
       document.getElementById("measureBtn").textContent = "Stop Measuring";
       setStatus("Measuring: Click points on map for distance (great for hose lays).");
     }
+  }
+
+  /* UTILITIES (haversine, escapeHtml, links, rings) */
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[c]));
+  }
+
+  function haversineMeters(lat1, lon1, lat2, lon2) {
+    const R = 6371000;
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(a));
+  }
+
+  function metersToFeet(m) { return m * 3.28084; }
+  function ftToMeters(ft) { return ft * 0.3048; }
+
+  function googleNavLink(lat, lon) { return `https://www.google.com/maps/dir/?api=1&destination=${lat},${lon}&travelmode=driving`; }
+  function appleNavLink(lat, lon) { return `https://maps.apple.com/?daddr=${lat},${lon}&dirflg=d`; }
+
+  function clearRings() { ringsLayer.clearLayers(); }
+
+  function drawRings(lat, lon) {
+    clearRings();
+    if (!document.getElementById("ringsToggle").checked || !lat || !lon) return;
+    L.circle([lat, lon], { radius: ftToMeters(300), weight: 2, fillOpacity: 0.03, color: '#888' }).addTo(ringsLayer);
+    L.circle([lat, lon], { radius: ftToMeters(600), weight: 2, fillOpacity: 0.02, color: '#888' }).addTo(ringsLayer);
+    L.circle([lat, lon], { radius: ftToMeters(1000), weight: 2, fillOpacity: 0.01, color: '#888' }).addTo(ringsLayer);
   }
 
   /* EVENTS */
